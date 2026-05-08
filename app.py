@@ -118,16 +118,27 @@ gas = data["gas"]
 news = data["news"]
 forecast = data["forecast"]
 
-# Current snapshot values
-latest = merged.dropna().iloc[-1]
+# Debug: show merge diagnostics if something is empty
+if merged.empty or merged.dropna().empty:
+    st.error("⚠️ Data merge failed — showing diagnostics below.")
+    st.write("**prices shape:**", data["prices"].shape)
+    st.write("**prices sample:**", data["prices"].head(3))
+    st.write("**weather shape:**", data["weather"].shape)
+    st.write("**weather sample:**", data["weather"].head(3))
+    st.write("**merged shape:**", merged.shape)
+    st.write("**merged after dropna:**", merged.dropna().shape)
+    st.stop()
+
+# Current snapshot — use last row that has all key columns filled
+latest = merged.dropna(subset=["lmp", "temp_f", "wind_mph"]).iloc[-1]
 current_lmp = latest["lmp"]
 current_temp = latest["temp_f"]
 current_wind = latest["wind_mph"]
-current_zscore = latest["lmp_zscore"]
-current_vol = latest["volatility"]
+current_zscore = latest.get("lmp_zscore", 0.0)
+current_vol = latest.get("volatility", 0.1)
 current_gas = float(gas["gas_price"].iloc[-1])
 current_hour = int(latest["hour"])
-roll24_mean = latest["lmp_roll24"]
+roll24_mean = latest["lmp_roll24"] if pd.notna(latest.get("lmp_roll24")) else current_lmp
 
 # Compute spike probability + signal
 spike_prob, factors = spike_probability(
