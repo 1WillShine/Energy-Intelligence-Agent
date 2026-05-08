@@ -51,7 +51,7 @@ def _fetch_caiso_day(date):
                 df = pd.read_csv(f)
         df = df[["INTERVALSTARTTIME_GMT", "MW"]].copy()
         df.columns = ["datetime", "lmp"]
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.floor("h")
         return df
     except Exception:
         return None
@@ -73,7 +73,6 @@ def fetch_caiso_prices(days=90):
         print("  → CAISO unavailable, using synthetic prices")
         return _synthetic_prices(days)
     result = pd.concat(frames, ignore_index=True)
-    result["datetime"] = result["datetime"].dt.floor("h")
     result = result.groupby("datetime")["lmp"].mean().reset_index()
     print(f"  → {len(result)} hourly rows")
     return result
