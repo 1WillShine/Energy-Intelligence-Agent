@@ -1,1 +1,691 @@
+"""
+app.py — Energy Intelligence Platform
+Run: streamlit run app.py
 
+Requires:
+  pip install streamlit plotly pandas numpy requests anthropic
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import anthropic
+
+from pipeline import fetch_all, _synthetic_prices, _synthetic_gas, _placeholder_news, fetch_weather_forecast
+from models import (
+    spike_probability, trading_signal, simulate_temp_shock,
+    simulate_gas_shock, hedge_expected_value, classify_vol_regime, da_rt_spread_signal
+)
+
+# ─── Page Config ──────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="GridEdge Intelligence",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─── Styling ──────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+  /* Dark professional theme */
+  .stApp { background-color: #0d1117; color: #e6edf3; }
+  section[data-testid="stSidebar"] { background-color: #161b22; }
+  .metric-card {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 10px;
+  }
+  .metric-value { font-size: 2rem; font-weight: 700; color: #58a6ff; }
+  .metric-label { font-size: 0.8rem; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+  .signal-box {
+    border-radius: 8px;
+    padding: 18px 24px;
+    font-size: 1.4rem;
+    font-weight: 700;
+    text-align: center;
+    margin: 10px 0;
+  }
+  .news-card {
+    background: #161b22;
+    border-left: 3px solid #58a6ff;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+    border-radius: 0 6px 6px 0;
+  }
+  .supply-node {
+    background: #1c2128;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+    font-size: 0.85rem;
+  }
+  h1, h2, h3 { color: #e6edf3 !important; }
+  .stTabs [data-baseweb="tab"] { color: #8b949e; }
+  .stTabs [aria-selected="true"] { color: #58a6ff !important; border-bottom-color: #58a6ff !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("## ⚡ GridEdge Intelligence")
+    st.markdown("*Energy Market Intelligence Platform*")
+    st.markdown("---")
+
+    st.markdown("### 🔑 API Keys")
+    anthropic_key = st.text_input("Anthropic API Key", type="password",
+                                   help="Get free key at console.anthropic.com")
+    st.caption("Weather data is free. EIA/News keys optional.")
+
+    st.markdown("---")
+    st.markdown("### ⚙️ Settings")
+    price_days = st.slider("Historical window (days)", 30, 90, 60)
+    auto_refresh = st.toggle("Auto-refresh (5 min)", value=False)
+
+    st.markdown("---")
+    st.markdown("### 📍 Market")
+    st.markdown("**Zone:** NP-15 (N. California)")
+    st.markdown("**Node:** TH_NP15_GEN-APND")
+    st.markdown("**ISO:** CAISO")
+
+    st.markdown("---")
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+
+# ─── Data Loading ─────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def load_data(days):
+    return fetch_all(price_days=days, mix_days=7)
+
+
+with st.spinner("Loading energy market data..."):
+    data = load_data(price_days)
+
+merged = data["merged"]
+genmix = data["genmix"]
+gas = data["gas"]
+news = data["news"]
+forecast = data["forecast"]
+
+# Current snapshot values
+latest = merged.dropna().iloc[-1]
+current_lmp = latest["lmp"]
+current_temp = latest["temp_f"]
+current_wind = latest["wind_mph"]
+current_zscore = latest["lmp_zscore"]
+current_vol = latest["volatility"]
+current_gas = float(gas["gas_price"].iloc[-1])
+current_hour = int(latest["hour"])
+roll24_mean = latest["lmp_roll24"]
+
+# Compute spike probability + signal
+spike_prob, factors = spike_probability(
+    current_temp, current_wind, current_gas, current_hour, current_zscore
+)
+signal, rationale = trading_signal(spike_prob, current_lmp, roll24_mean)
+vol_label, vol_color = classify_vol_regime(current_vol)
+
+# ─── Header ───────────────────────────────────────────────────────────────────
+
+st.markdown("# ⚡ GridEdge Energy Intelligence")
+st.markdown(f"*Real-time electricity market intelligence for CAISO NP-15 · Updated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
+st.markdown("---")
+
+# ─── Top KPI Row ──────────────────────────────────────────────────────────────
+
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+
+with k1:
+    st.metric("⚡ LMP Price", f"${current_lmp:.2f}/MWh",
+              delta=f"{current_lmp - roll24_mean:+.1f} vs 24h avg")
+with k2:
+    st.metric("🌡️ Temperature", f"{current_temp:.0f}°F")
+with k3:
+    st.metric("💨 Wind Speed", f"{current_wind:.0f} mph")
+with k4:
+    st.metric("🔥 Gas Price", f"${current_gas:.2f}/MMBtu")
+with k5:
+    st.metric("📊 Vol Regime", vol_label)
+with k6:
+    st.metric("⚠️ Spike Prob", f"{spike_prob:.0%}")
+
+st.markdown("---")
+
+# ─── Main Signal Banner ───────────────────────────────────────────────────────
+
+color = "#ff4444" if "HEDGE" in signal else "#ffaa00" if "BUY" in signal else "#44bb44"
+st.markdown(f"""
+<div class="signal-box" style="background: {color}22; border: 2px solid {color};">
+  {signal} &nbsp;|&nbsp; <span style="font-size:1rem; font-weight:400;">{rationale}</span>
+</div>
+""", unsafe_allow_html=True)
+
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📈 Market", "🏭 Supply Chain", "☁️ Weather & Forecast",
+    "⚠️ Risk & Signals", "🤖 AI Agent", "📰 News Feed"
+])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — MARKET
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab1:
+    st.markdown("### Electricity Price & Market Dynamics")
+
+    # Price chart with volatility bands + spike flags
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.55, 0.25, 0.20],
+                        subplot_titles=("LMP Price ($/MWh)", "24h Rolling Volatility", "Z-Score"),
+                        vertical_spacing=0.06)
+
+    df_plot = merged.dropna().tail(24 * 30)  # last 30 days
+
+    # Price line + bands
+    fig.add_trace(go.Scatter(x=df_plot["datetime"], y=df_plot["lmp"],
+                             name="LMP", line=dict(color="#58a6ff", width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_plot["datetime"], y=df_plot["lmp_roll24"],
+                             name="24h Mean", line=dict(color="#f0a500", width=1, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=pd.concat([df_plot["datetime"], df_plot["datetime"][::-1]]),
+        y=pd.concat([df_plot["lmp_roll24"] + 2 * df_plot["lmp_std24"],
+                     (df_plot["lmp_roll24"] - 2 * df_plot["lmp_std24"])[::-1]]),
+        fill="toself", fillcolor="rgba(88,166,255,0.08)",
+        line=dict(color="rgba(0,0,0,0)"), name="±2σ Band", showlegend=True
+    ), row=1, col=1)
+
+    # Spike markers
+    spikes = df_plot[df_plot["spike"] == 1]
+    fig.add_trace(go.Scatter(x=spikes["datetime"], y=spikes["lmp"],
+                             mode="markers", marker=dict(color="#ff4444", size=7, symbol="triangle-up"),
+                             name="Spike (>2σ)"), row=1, col=1)
+
+    # Volatility
+    fig.add_trace(go.Scatter(x=df_plot["datetime"], y=df_plot["volatility"],
+                             fill="tozeroy", fillcolor="rgba(240,165,0,0.15)",
+                             line=dict(color="#f0a500"), name="Volatility", showlegend=False), row=2, col=1)
+
+    # Z-score
+    fig.add_trace(go.Scatter(x=df_plot["datetime"], y=df_plot["lmp_zscore"],
+                             line=dict(color="#bc8cff"), name="Z-Score", showlegend=False), row=3, col=1)
+    fig.add_hline(y=2.0, line_dash="dot", line_color="#ff4444", row=3, col=1)
+    fig.add_hline(y=-2.0, line_dash="dot", line_color="#44bb44", row=3, col=1)
+
+    fig.update_layout(height=600, template="plotly_dark",
+                      paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                      legend=dict(orientation="h", y=1.02))
+    fig.update_yaxes(gridcolor="#21262d")
+    fig.update_xaxes(gridcolor="#21262d")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # DA/RT Spread
+    st.markdown("### Day-Ahead vs Real-Time Spread")
+    spread_df = da_rt_spread_signal(merged).tail(24 * 14)
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(x=spread_df["datetime"], y=spread_df["da_rt_spread"],
+                          marker_color=np.where(spread_df["da_rt_spread"] > 0, "#ff4444", "#44bb44"),
+                          name="DA/RT Spread"))
+    fig2.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                       plot_bgcolor="#0d1117", height=250,
+                       title="RT LMP − DA Proxy ($/MWh) — positive = real-time tighter than forecast")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # Gas price correlation
+    st.markdown("### Gas Price vs LMP (Supply Cost Transmission)")
+    daily_lmp = merged.groupby(merged["datetime"].dt.date)["lmp"].mean().reset_index()
+    daily_lmp.columns = ["date", "avg_lmp"]
+    daily_lmp["date"] = pd.to_datetime(daily_lmp["date"])
+    gas_merged = pd.merge(daily_lmp, gas, on="date", how="inner")
+    if len(gas_merged) > 5:
+        fig3 = px.scatter(gas_merged, x="gas_price", y="avg_lmp",
+                          trendline="ols",
+                          labels={"gas_price": "Henry Hub Gas ($/MMBtu)", "avg_lmp": "Avg Daily LMP ($/MWh)"},
+                          template="plotly_dark", color_discrete_sequence=["#58a6ff"])
+        fig3.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117", height=300)
+        st.plotly_chart(fig3, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SUPPLY CHAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab2:
+    st.markdown("### Electricity Supply Chain")
+
+    # Flow diagram using Plotly Sankey
+    st.markdown("#### Supply Chain Flow: Fuel → Generation → Grid → Consumer")
+
+    latest_mix = genmix.iloc[-1]
+    total = latest_mix["total_mw"]
+
+    fig_sankey = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=20, thickness=25,
+            label=["☀️ Solar", "💨 Wind", "⚛️ Nuclear", "💧 Hydro", "🔥 Natural Gas",
+                   "🏭 Generation Pool", "🔌 Transmission Grid", "🏢 Commercial",
+                   "🏠 Residential", "🏭 Industrial"],
+            color=["#f0a500", "#58a6ff", "#bc8cff", "#1f9cf0", "#ff6b35",
+                   "#30363d", "#21262d", "#44bb44", "#44bb44", "#44bb44"],
+            x=[0.0, 0.0, 0.0, 0.0, 0.0, 0.35, 0.65, 1.0, 1.0, 1.0],
+            y=[0.05, 0.25, 0.45, 0.65, 0.85, 0.45, 0.45, 0.15, 0.50, 0.85],
+        ),
+        link=dict(
+            source=[0, 1, 2, 3, 4, 5, 6, 6, 6],
+            target=[5, 5, 5, 5, 5, 6, 7, 8, 9],
+            value=[
+                latest_mix["solar_mw"], latest_mix["wind_mw"],
+                latest_mix["nuclear_mw"], latest_mix["hydro_mw"], latest_mix["gas_mw"],
+                total, total * 0.35, total * 0.38, total * 0.27,
+            ],
+            color=["rgba(240,165,0,0.4)", "rgba(88,166,255,0.4)", "rgba(188,140,255,0.4)",
+                   "rgba(31,156,240,0.4)", "rgba(255,107,53,0.4)",
+                   "rgba(48,54,61,0.5)", "rgba(68,187,68,0.3)", "rgba(68,187,68,0.3)", "rgba(68,187,68,0.3)"],
+        )
+    ))
+    fig_sankey.update_layout(
+        template="plotly_dark", paper_bgcolor="#0d1117", height=420,
+        font=dict(color="#e6edf3", size=13)
+    )
+    st.plotly_chart(fig_sankey, use_container_width=True)
+
+    # Generation mix over time
+    st.markdown("#### Generation Mix Over Time (MW)")
+    gm = genmix.tail(7 * 24)
+    fig_mix = go.Figure()
+    colors = {"solar_mw": "#f0a500", "wind_mw": "#58a6ff",
+              "nuclear_mw": "#bc8cff", "hydro_mw": "#1f9cf0", "gas_mw": "#ff6b35"}
+    labels = {"solar_mw": "Solar", "wind_mw": "Wind",
+              "nuclear_mw": "Nuclear", "hydro_mw": "Hydro", "gas_mw": "Gas"}
+    for col, color in colors.items():
+        fig_mix.add_trace(go.Scatter(
+            x=gm["datetime"], y=gm[col],
+            stackgroup="one", name=labels[col],
+            line=dict(width=0), fillcolor=color.replace("#", "rgba(") + ",0.7)"
+                      if False else color,
+            mode="lines"
+        ))
+    fig_mix.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                          plot_bgcolor="#0d1117", height=350,
+                          yaxis_title="MW", legend=dict(orientation="h"))
+    st.plotly_chart(fig_mix, use_container_width=True)
+
+    # Current mix donut
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        st.markdown("#### Current Generation Mix")
+        vals = [latest_mix["solar_mw"], latest_mix["wind_mw"], latest_mix["nuclear_mw"],
+                latest_mix["hydro_mw"], latest_mix["gas_mw"]]
+        lbls = ["Solar", "Wind", "Nuclear", "Hydro", "Gas"]
+        fig_donut = go.Figure(go.Pie(
+            labels=lbls, values=vals, hole=0.55,
+            marker_colors=["#f0a500", "#58a6ff", "#bc8cff", "#1f9cf0", "#ff6b35"]
+        ))
+        fig_donut.update_layout(template="plotly_dark", paper_bgcolor="#0d1117", height=300,
+                                showlegend=True, legend=dict(orientation="h"))
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    with col_b:
+        st.markdown("#### Renewable Penetration")
+        genmix["renewable_pct"] = (genmix["solar_mw"] + genmix["wind_mw"] + genmix["hydro_mw"]) / genmix["total_mw"] * 100
+        fig_ren = go.Figure(go.Scatter(
+            x=genmix["datetime"].tail(168), y=genmix["renewable_pct"].tail(168),
+            fill="tozeroy", fillcolor="rgba(68,187,68,0.2)",
+            line=dict(color="#44bb44"), name="Renewable %"
+        ))
+        fig_ren.add_hline(y=50, line_dash="dash", line_color="#f0a500",
+                          annotation_text="50% threshold")
+        fig_ren.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                              plot_bgcolor="#0d1117", height=300,
+                              yaxis_title="% Renewable")
+        st.plotly_chart(fig_ren, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — WEATHER & FORECAST
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab3:
+    st.markdown("### Weather Intelligence")
+    st.caption("Weather is the #1 driver of electricity demand spikes. Temperature extremes → AC/heating load → LMP price spikes.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Temperature vs LMP (Last 30 Days)")
+        df_tw = merged.dropna().tail(24 * 30)
+        fig_tw = go.Figure()
+        fig_tw.add_trace(go.Scatter(x=df_tw["datetime"], y=df_tw["temp_f"],
+                                    name="Temperature (°F)", line=dict(color="#f0a500"), yaxis="y1"))
+        fig_tw.add_trace(go.Scatter(x=df_tw["datetime"], y=df_tw["lmp"],
+                                    name="LMP ($/MWh)", line=dict(color="#58a6ff"), yaxis="y2"))
+        fig_tw.update_layout(
+            template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            height=350,
+            yaxis=dict(title="Temperature (°F)", gridcolor="#21262d"),
+            yaxis2=dict(title="LMP ($/MWh)", overlaying="y", side="right"),
+            legend=dict(orientation="h")
+        )
+        st.plotly_chart(fig_tw, use_container_width=True)
+
+    with col2:
+        st.markdown("#### 7-Day Forecast")
+        fig_fc = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                               subplot_titles=("Temp Forecast (°F)", "Wind Forecast (mph)"),
+                               vertical_spacing=0.1)
+        fig_fc.add_trace(go.Scatter(x=forecast["datetime"], y=forecast["temp_f"],
+                                    fill="tozeroy", fillcolor="rgba(240,165,0,0.15)",
+                                    line=dict(color="#f0a500"), name="Temp"), row=1, col=1)
+        fig_fc.add_hline(y=95, line_dash="dot", line_color="#ff4444",
+                         annotation_text="Heat stress (95°F)", row=1, col=1)
+        fig_fc.add_trace(go.Scatter(x=forecast["datetime"], y=forecast["wind_mph"],
+                                    fill="tozeroy", fillcolor="rgba(88,166,255,0.15)",
+                                    line=dict(color="#58a6ff"), name="Wind"), row=2, col=1)
+        fig_fc.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                             plot_bgcolor="#0d1117", height=350)
+        st.plotly_chart(fig_fc, use_container_width=True)
+
+    # Solar radiation vs solar generation
+    st.markdown("#### Solar Radiation → Solar Generation Relationship")
+    gm_weather = pd.merge(
+        genmix[["datetime", "solar_mw"]],
+        merged[["datetime", "solar_rad"]],
+        on="datetime", how="inner"
+    ).dropna()
+    if len(gm_weather) > 10:
+        fig_sol = px.scatter(gm_weather, x="solar_rad", y="solar_mw",
+                             labels={"solar_rad": "Solar Radiation (W/m²)", "solar_mw": "Solar Generation (MW)"},
+                             trendline="ols", template="plotly_dark",
+                             color_discrete_sequence=["#f0a500"])
+        fig_sol.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117", height=280)
+        st.plotly_chart(fig_sol, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — RISK & SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab4:
+    st.markdown("### Risk Intelligence & Trading Signals")
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.markdown("#### Spike Probability Breakdown")
+        st.markdown(f"**Current probability: {spike_prob:.1%}**")
+
+        factor_names = list(factors.keys())
+        factor_vals = [v * 100 for v in factors.values()]
+        colors_bar = ["#ff4444" if v > 10 else "#f0a500" if v > 5 else "#44bb44" for v in factor_vals]
+        fig_factors = go.Figure(go.Bar(
+            x=factor_vals, y=factor_names, orientation="h",
+            marker_color=colors_bar,
+            text=[f"{v:.1f}%" for v in factor_vals], textposition="outside"
+        ))
+        fig_factors.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                                  plot_bgcolor="#0d1117", height=280,
+                                  xaxis_title="Contribution to spike probability (%)",
+                                  xaxis=dict(range=[0, 35]))
+        st.plotly_chart(fig_factors, use_container_width=True)
+
+    with col2:
+        st.markdown("#### Expected Value of Hedging")
+        vol_mw = st.slider("Volume (MW)", 10, 500, 100)
+        spike_mag = st.slider("Spike magnitude ($/MWh)", 50, 500, 150)
+        hedge_cost = st.slider("Hedge cost ($/MWh)", 2, 30, 8)
+
+        ev = hedge_expected_value(spike_prob, current_lmp, spike_mag, hedge_cost, vol_mw)
+        net = ev["net_benefit_of_hedging_usd"]
+        st.markdown(f"""
+        | | Value |
+        |---|---|
+        | Spike probability | {ev['prob_spike']:.1%} |
+        | EV (no hedge) | **${ev['ev_no_hedge_usd']:,.0f}** |
+        | EV (hedge) | **${ev['ev_hedge_usd']:,.0f}** |
+        | Net benefit of hedging | **${net:,.0f}** |
+        | Recommendation | **{ev['recommendation']}** |
+        """)
+
+    # Counterfactual simulations
+    st.markdown("---")
+    st.markdown("#### 🔬 Counterfactual Simulation")
+    st.caption("*'What if' analysis — how sensitive is spike risk to key inputs?*")
+
+    sim_col1, sim_col2 = st.columns(2)
+
+    with sim_col1:
+        st.markdown("**Temperature shock**")
+        delta_temp = st.slider("Temperature change (°F)", -20, +30, +5)
+        sim_t = simulate_temp_shock(current_temp, delta_temp, current_wind,
+                                    current_gas, current_hour, current_zscore)
+        fig_sim_t = go.Figure(go.Bar(
+            x=["Base", f"Base + {delta_temp}°F"],
+            y=[sim_t["base_prob"] * 100, sim_t["shock_prob"] * 100],
+            marker_color=["#58a6ff", "#ff4444" if sim_t["shock_prob"] > 0.4 else "#f0a500"],
+            text=[f"{sim_t['base_prob']:.1%}", f"{sim_t['shock_prob']:.1%}"],
+            textposition="outside"
+        ))
+        fig_sim_t.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                                plot_bgcolor="#0d1117", height=220,
+                                yaxis=dict(range=[0, 110], title="Spike Probability (%)"))
+        st.plotly_chart(fig_sim_t, use_container_width=True)
+        st.caption(f"Δ Probability: **{sim_t['delta_prob']:+.1%}**")
+
+    with sim_col2:
+        st.markdown("**Gas price shock**")
+        delta_gas = st.slider("Gas price change ($/MMBtu)", -2.0, +4.0, +1.0, step=0.25)
+        sim_g = simulate_gas_shock(current_temp, current_wind, current_gas,
+                                   delta_gas, current_hour, current_zscore)
+        fig_sim_g = go.Figure(go.Bar(
+            x=["Base", f"Base + ${delta_gas:.2f}"],
+            y=[sim_g["base_prob"] * 100, sim_g["shock_prob"] * 100],
+            marker_color=["#58a6ff", "#ff4444" if sim_g["shock_prob"] > 0.4 else "#f0a500"],
+            text=[f"{sim_g['base_prob']:.1%}", f"{sim_g['shock_prob']:.1%}"],
+            textposition="outside"
+        ))
+        fig_sim_g.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                                plot_bgcolor="#0d1117", height=220,
+                                yaxis=dict(range=[0, 110], title="Spike Probability (%)"))
+        st.plotly_chart(fig_sim_g, use_container_width=True)
+        st.caption(f"Δ Probability: **{sim_g['delta_prob']:+.1%}**")
+
+    # Rolling spike probability over time
+    st.markdown("#### Rolling Spike Probability (Last 14 Days)")
+    df_roll = merged.dropna().tail(14 * 24).copy()
+    df_roll["spike_prob_est"] = (
+        (np.maximum(df_roll["temp_f"] - 95, 0) / 20 * 0.30).clip(0, 0.30) +
+        (np.maximum(15 - df_roll["wind_mph"], 0) / 15 * 0.20).clip(0, 0.20) +
+        (df_roll["lmp_zscore"].clip(0, 3) / 3 * 0.10)
+    ).clip(0, 0.97)
+
+    fig_roll = go.Figure()
+    fig_roll.add_trace(go.Scatter(x=df_roll["datetime"], y=df_roll["spike_prob_est"],
+                                  fill="tozeroy", fillcolor="rgba(255,68,68,0.15)",
+                                  line=dict(color="#ff4444"), name="Est. Spike Prob"))
+    fig_roll.add_hline(y=0.60, line_dash="dash", line_color="#ff4444",
+                       annotation_text="HEDGE threshold")
+    fig_roll.add_hline(y=0.35, line_dash="dash", line_color="#f0a500",
+                       annotation_text="BUY EARLY threshold")
+    fig_roll.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
+                           plot_bgcolor="#0d1117", height=280,
+                           yaxis=dict(title="Spike Probability", tickformat=".0%"))
+    st.plotly_chart(fig_roll, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — AI AGENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab5:
+    st.markdown("### 🤖 AI Energy Intelligence Agent")
+    st.caption("Powered by Claude. Synthesizes live market data + news to answer your energy trading questions.")
+
+    if not anthropic_key:
+        st.warning("⚠️ Enter your Anthropic API key in the sidebar to activate the AI agent.")
+        st.markdown("""
+        **What the agent can do:**
+        - Analyze current market conditions and explain the spike signal
+        - Interpret breaking news in the context of your position
+        - Recommend hedging strategies based on live data
+        - Answer complex 'what if' questions in plain English
+        - Explain electricity market mechanics (LMP, Day-Ahead vs Real-Time, etc.)
+        """)
+    else:
+        # Build live market context for the agent
+        news_text = "\n".join([f"- {n['title']}: {n['description']}" for n in news[:5]])
+        gm = genmix.iloc[-1]
+
+        system_prompt = f"""You are an expert energy market analyst and quantitative trader specializing in 
+US electricity markets, specifically CAISO (California ISO). You have deep expertise in:
+- LMP (Locational Marginal Pricing) mechanics and drivers
+- Day-ahead vs real-time market dynamics and arbitrage
+- Electricity supply chain: fuel → generation → transmission → consumers
+- Risk management: hedging with futures, forward contracts, options
+- How weather, gas prices, and renewables drive electricity prices
+- How to think probabilistically about price spikes
+
+You are currently monitoring the CAISO NP-15 node. Here is the live market snapshot:
+
+CURRENT MARKET DATA:
+- LMP Price: ${current_lmp:.2f}/MWh (24h avg: ${roll24_mean:.2f}/MWh)
+- Temperature: {current_temp:.0f}°F in San Francisco
+- Wind Speed: {current_wind:.0f} mph
+- Natural Gas (Henry Hub): ${current_gas:.2f}/MMBtu
+- Price Z-Score: {current_zscore:.2f} (>2.0 = spike territory)
+- Volatility Regime: {vol_label}
+- Spike Probability (next 12h): {spike_prob:.1%}
+- Current Trading Signal: {signal}
+
+GENERATION MIX RIGHT NOW:
+- Solar: {gm['solar_mw']:,.0f} MW ({gm['solar_mw']/gm['total_mw']*100:.0f}%)
+- Wind: {gm['wind_mw']:,.0f} MW ({gm['wind_mw']/gm['total_mw']*100:.0f}%)
+- Gas: {gm['gas_mw']:,.0f} MW ({gm['gas_mw']/gm['total_mw']*100:.0f}%)
+- Nuclear: {gm['nuclear_mw']:,.0f} MW
+- Hydro: {gm['hydro_mw']:,.0f} MW
+- Total: {gm['total_mw']:,.0f} MW
+
+RECENT NEWS HEADLINES:
+{news_text}
+
+When answering:
+- Be precise and quantitative where possible
+- Connect market mechanics to the numbers above
+- If news is relevant, cite specific headlines
+- Be concise but substantive — this is for a sophisticated trader
+- Do NOT use generic disclaimers like "consult a financial advisor"
+"""
+
+        # Chat interface
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Suggested prompts
+        st.markdown("**Quick questions:**")
+        q_cols = st.columns(3)
+        quick_questions = [
+            "What's driving the current spike signal?",
+            "How does today's news affect my position?",
+            "Explain the DA/RT spread I'm seeing",
+            "Should I hedge given current gas prices?",
+            "What would a 10°F temp spike do to prices?",
+            "Explain LMP mechanics in simple terms",
+        ]
+        for i, q in enumerate(quick_questions):
+            with q_cols[i % 3]:
+                if st.button(q, key=f"quick_{i}", use_container_width=True):
+                    st.session_state.messages.append({"role": "user", "content": q})
+
+        st.markdown("---")
+
+        # Display chat history
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Chat input
+        if prompt := st.chat_input("Ask about current market conditions, news, trading signals..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing..."):
+                    try:
+                        client = anthropic.Anthropic(api_key=anthropic_key)
+                        response = client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=1000,
+                            system=system_prompt,
+                            messages=[
+                                {"role": m["role"], "content": m["content"]}
+                                for m in st.session_state.messages
+                            ]
+                        )
+                        reply = response.content[0].text
+                        st.markdown(reply)
+                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                    except Exception as e:
+                        st.error(f"Agent error: {e}")
+
+        if st.session_state.messages:
+            if st.button("Clear conversation"):
+                st.session_state.messages = []
+                st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — NEWS FEED
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab6:
+    st.markdown("### 📰 Energy Market News Feed")
+    st.caption("Recent headlines relevant to CAISO electricity prices and supply chain.")
+
+    for article in news:
+        st.markdown(f"""
+<div class="news-card">
+  <strong>{article['title']}</strong><br>
+  <span style="color:#8b949e; font-size:0.85rem;">{article.get('description', '')}</span><br>
+  <span style="color:#58a6ff; font-size:0.78rem;">🕐 {article['published'][:16].replace('T', ' ')} UTC</span>
+  {"&nbsp;&nbsp;<a href='" + article['url'] + "' target='_blank' style='color:#58a6ff;'>Read →</a>" if article['url'] != '#' else ''}
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 💡 Market Interpretation")
+    st.caption("How the above headlines connect to electricity prices:")
+
+    for article in news[:3]:
+        title = article["title"].lower()
+        if "heat" in title or "temperature" in title:
+            st.info(f"🌡️ **Heat events** → demand surge → LMP spike risk HIGH")
+        elif "gas" in title or "lng" in title:
+            st.warning(f"🔥 **Gas price movement** → shifts marginal cost of gas peakers → direct LMP impact")
+        elif "solar" in title or "wind" in title or "renewable" in title:
+            st.success(f"☀️ **High renewable output** → displaces gas → can push LMPs lower or even negative")
+        elif "transmission" in title or "outage" in title or "constraint" in title:
+            st.error(f"⚡ **Grid constraints** → congestion costs → localized LMP spikes")
+
+# ─── Footer ───────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center; color:#8b949e; font-size:0.8rem;'>"
+    "GridEdge Intelligence · CAISO NP-15 · Data: CAISO OASIS, Open-Meteo, EIA · "
+    "For educational and research purposes only · Not financial advice"
+    "</div>",
+    unsafe_allow_html=True
+)
