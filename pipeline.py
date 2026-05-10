@@ -81,7 +81,8 @@ def fetch_caiso_prices(days=90):
 def _synthetic_prices(days=90):
     """Realistic synthetic LMP prices when CAISO API is unavailable."""
     hours = days * 24
-    idx = pd.date_range(end=datetime.utcnow(), periods=hours, freq="h", tz="UTC")
+    idx = pd.date_range(end=datetime.utcnow().replace(minute=0, second=0, microsecond=0),
+                    periods=hours, freq="h", tz="UTC")
     hour = idx.hour
     # Typical dual-peak electricity price shape (morning + evening peaks)
     base = 35 + 20 * np.sin((hour - 6) * np.pi / 12)
@@ -275,7 +276,7 @@ def fetch_all(price_days=90, mix_days=7):
     Fetch all data. Returns dict of DataFrames + news list.
     Keys: prices, weather, forecast, genmix, gas, news, merged
     """
-    prices = fetch_caiso_prices(days=price_days)
+    prices = _synthetic_prices(price_days)  # TEMP: bypass CAISO
     weather = fetch_weather(days=price_days)
     forecast = fetch_weather_forecast()
     genmix = fetch_caiso_genmix(days=mix_days)
