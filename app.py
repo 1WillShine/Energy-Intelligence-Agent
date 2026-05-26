@@ -30,7 +30,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+if auto_refresh:
+    import time
+    time.sleep(60)
+    st.rerun()
 # ─── Styling ──────────────────────────────────────────────────────────────────
 
 st.markdown("""
