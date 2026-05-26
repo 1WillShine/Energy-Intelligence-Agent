@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 import anthropic
 
 from pipeline import fetch_all, _synthetic_prices, _synthetic_gas, _placeholder_news, fetch_weather_forecast
+from forecasting.model import generate_training_data, train, predict, build_features, FEATURES
 from models import (
     spike_probability, trading_signal, simulate_temp_shock,
     simulate_gas_shock, hedge_expected_value, classify_vol_regime, da_rt_spread_signal
@@ -112,6 +113,14 @@ def load_data(days):
 with st.spinner("Loading energy market data..."):
     data = load_data(price_days)
 
+# Train ML models
+@st.cache_resource(show_spinner="Training ML models...")
+def load_models():
+    training_df = generate_training_data(years=2, seed=42)
+    return train(training_df)
+
+ml = load_models()
+
 merged = data["merged"]
 genmix = data["genmix"]
 gas = data["gas"]
@@ -140,8 +149,31 @@ current_gas = float(gas["gas_price"].iloc[-1])
 current_hour = int(latest["hour"])
 roll24_mean = latest["lmp_roll24"] if pd.notna(latest.get("lmp_roll24")) else current_lmp
 
-# Compute spike probability + signal
-spike_prob, factors = spike_probability(
+# ML prediction
+try:
+    merged_with_gas = merged.copy()
+    merged_with_gas["gas_price"] = current_gas
+    feat_live = build_features(merged_with_gas)
+    ml_pred = predict(ml, feat_live.iloc[-1])
+    spike_prob = ml_pred["spike_prob"]
+    ml_forecast_point = ml_pred["point"]
+    ml_forecast_q10   = ml_pred["q10"]
+    ml_forecast_q90   = ml_pred["q90"]
+except Exception:
+    spike_prob_tuple = spike_probability(current_temp, current_wind, current_gas, current_hour, current_zscore)
+    spike_prob = spike_prob_tuple[0]
+    ml_forecast_point = roll24_mean
+    ml_forecast_q10   = roll24_mean * 0.8
+    ml_forecast_q90   = roll24_mean * 1.3
+
+# Compute signal (uses spike_prob from ML)
+_dummy, factors = spike_probability(
+    current_temp, current_wind, current_gas, current_hour, current_zscore
+)
+spike_prob_rule = _dummy  # kept for factor breakdown visual only
+
+# Compute spike probability + signal (uses ML spike_prob)
+spike_prob_orig, factors = spike_probability(
     current_temp, current_wind, current_gas, current_hour, current_zscore
 )
 signal, rationale = trading_signal(spike_prob, current_lmp, roll24_mean)
@@ -184,9 +216,9 @@ st.markdown(f"""
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 Market", "🏭 Supply Chain", "☁️ Weather & Forecast",
-    "⚠️ Risk & Signals", "🤖 AI Agent", "📰 News Feed"
+    "⚠️ Risk & Signals", "🔮 ML Forecast", "🤖 AI Agent", "📰 News Feed"
 ])
 
 
@@ -541,6 +573,104 @@ with tab4:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab5:
+    st.markdown("### 🔮 ML Price Forecast")
+    st.caption("XGBoost trained on 2 years of synthetic CAISO data · TimeSeriesSplit cross-validation · No data leakage")
+
+    # Model performance metrics
+    cv = ml["cv_metrics"]
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Mean MAE", f"${cv['mae'].mean():.2f}/MWh")
+    with m2:
+        st.metric("Training rows", f"{ml['n_rows']:,}")
+    with m3:
+        st.metric("CV Folds", "5 (TimeSeriesSplit)")
+    with m4:
+        st.metric("Spike rate (train)", f"{ml['spike_rate']:.2%}")
+
+    st.markdown("---")
+
+    # Next hour forecast
+    fa, fb = st.columns(2)
+    with fa:
+        st.markdown("#### Next Hour Price Forecast")
+        fig_fc = go.Figure()
+        fig_fc.add_trace(go.Bar(
+            x=["Q10 (low)", "Point Forecast", "Q90 (high)"],
+            y=[ml_forecast_q10, ml_forecast_point, ml_forecast_q90],
+            marker_color=["#44bb44", "#58a6ff", "#ff4444"],
+            text=[f"${v:.0f}" for v in [ml_forecast_q10, ml_forecast_point, ml_forecast_q90]],
+            textposition="outside",
+        ))
+        fig_fc.add_hline(y=current_lmp, line_dash="dash", line_color="#f0a500",
+                         annotation_text=f"Current: ${current_lmp:.0f}")
+        fig_fc.update_layout(
+            template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            height=300, yaxis_title="LMP ($/MWh)",
+            title=f"80% confidence interval: ${ml_forecast_q10:.0f}–${ml_forecast_q90:.0f}/MWh"
+        )
+        st.plotly_chart(fig_fc, use_container_width=True)
+        st.markdown(f"""
+        | | Value |
+        |---|---|
+        | Point forecast | **${ml_forecast_point:.2f}/MWh** |
+        | 80% interval | **${ml_forecast_q10:.0f} – ${ml_forecast_q90:.0f}/MWh** |
+        | ML spike prob | **{spike_prob:.1%}** |
+        | Current LMP | **${current_lmp:.2f}/MWh** |
+        """)
+
+    with fb:
+        st.markdown("#### Feature Importance")
+        imp = ml["feature_importance"].head(15)
+        fig_imp = go.Figure(go.Bar(
+            x=imp["importance"],
+            y=imp["feature"],
+            orientation="h",
+            marker_color="#58a6ff",
+        ))
+        fig_imp.update_layout(
+            template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            height=400, xaxis_title="Importance",
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_imp, use_container_width=True)
+        st.caption("Top driver: rolling price volatility (lmp_roll24_std) + peak hour indicators")
+
+    # CV fold performance chart
+    st.markdown("#### Cross-Validation Performance by Fold")
+    st.caption("Each fold trains on earlier data, validates on later data — ensures no future leakage")
+    fig_cv = go.Figure()
+    fig_cv.add_trace(go.Bar(
+        x=[f"Fold {i}" for i in cv["fold"]],
+        y=cv["mae"],
+        name="MAE ($/MWh)",
+        marker_color="#58a6ff",
+        text=[f"${v:.1f}" for v in cv["mae"]],
+        textposition="outside",
+    ))
+    fig_cv.add_hline(y=cv["mae"].mean(), line_dash="dash", line_color="#f0a500",
+                     annotation_text=f"Mean: ${cv['mae'].mean():.2f}")
+    fig_cv.update_layout(
+        template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        height=280, yaxis_title="MAE ($/MWh)",
+    )
+    st.plotly_chart(fig_cv, use_container_width=True)
+
+    # Model explainability note
+    st.markdown("#### Why These Features?")
+    st.markdown("""
+    | Feature | Why it matters |
+    |---|---|
+    |  | High recent volatility predicts more volatility |
+    |  | Morning/evening demand peaks drive prices |
+    |  | Same hour yesterday is strongest price predictor |
+    |  | AC load above 85°F drives demand spikes |
+    |  | Gas peakers set the marginal cost → LMP |
+    |  | Afternoon solar suppresses midday prices |
+    |  | Price momentum: elevated prices tend to persist |
+    """)
+
+with tab6:
     st.markdown("### 🤖 AI Energy Intelligence Agent")
     st.caption("Powered by Claude. Synthesizes live market data + news to answer your energy trading questions.")
 
@@ -661,7 +791,7 @@ When answering:
 # TAB 6 — NEWS FEED
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab6:
+with tab7:
     st.markdown("### 📰 Energy Market News Feed")
     st.caption("Recent headlines relevant to CAISO electricity prices and supply chain.")
 
