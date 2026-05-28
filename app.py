@@ -364,8 +364,7 @@ with st.expander("🧠 AI Market Intelligence — Live Synthesis", expanded=True
     else:
         # Build full market context
         _gm = genmix.iloc[-1]
-        _news_text = "
-".join([f"- {n['title']}" for n in news[:4]])
+        _news_text = "\n".join([f"- {n['title']}" for n in news[:4]])
         _fc_24h = forecast.head(24)
         _max_fc_temp = _fc_24h["temp_f"].max() if len(_fc_24h) > 0 else current_temp
 
@@ -390,7 +389,7 @@ CONFIDENCE: [Low/Medium/High]
 REASONING: [2-3 sentences connecting the signals above to the decision]
 WATCH: [One specific thing that would change this decision]"""
 
-        _cache_key = f"synthesis_{datetime.utcnow().strftime('%Y%m%d%H%M') // 5 * 5}"
+        _cache_key = f"synthesis_{datetime.utcnow().strftime('%Y%m%d%H')}{(datetime.utcnow().minute // 5) * 5}"
 
         if "synthesis_cache" not in st.session_state or st.session_state.get("synthesis_key") != _cache_key:
             with st.spinner("Synthesizing market signals..."):
@@ -406,8 +405,7 @@ WATCH: [One specific thing that would change this decision]"""
             _synthesis = st.session_state["synthesis_cache"]
 
         # Parse and display synthesis
-        _lines = _synthesis.strip().split("
-")
+        _lines = _synthesis.strip().splitlines()
         for _line in _lines:
             if _line.startswith("DECISION:"):
                 _dec = _line.replace("DECISION:", "").strip()
