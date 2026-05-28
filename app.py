@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 import anthropic
 
 from pipeline import fetch_all, _synthetic_prices, _synthetic_gas, _placeholder_news, fetch_weather_forecast
+from ingestion.realtime import DataManager
 from forecasting.model import generate_training_data, train, predict, build_features, FEATURES
 from models import (
     spike_probability, trading_signal, simulate_temp_shock,
@@ -30,10 +31,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-if auto_refresh:
-    import time
-    time.sleep(60)
-    st.rerun()
+
 # ─── Styling ──────────────────────────────────────────────────────────────────
 
 st.markdown("""
@@ -86,10 +84,24 @@ with st.sidebar:
     st.markdown("*Energy Market Intelligence Platform*")
     st.markdown("---")
 
-    st.markdown("### 🔑 API Keys")
-    anthropic_key = st.text_input("Anthropic API Key", type="password",
-                                   help="Get free key at console.anthropic.com")
-    st.caption("Weather data is free. EIA/News keys optional.")
+    st.markdown("### 🤖 AI Provider")
+    ai_provider = st.selectbox(
+        "Provider",
+        ["Groq (Free)", "Google Gemini (Free)", "Anthropic Claude (Paid)"],
+    )
+    if ai_provider == "Groq (Free)":
+        ai_key = st.text_input("Groq API Key", type="password",
+                               help="Free at console.groq.com")
+        st.caption("Free · 14,400 req/day · Llama 3.3 70B")
+    elif ai_provider == "Google Gemini (Free)":
+        ai_key = st.text_input("Gemini API Key", type="password",
+                               help="Free at aistudio.google.com")
+        st.caption("Free · 1,500 req/day · Gemini 2.5 Flash")
+    else:
+        ai_key = st.text_input("Anthropic API Key", type="password",
+                               help="Paid at console.anthropic.com")
+        st.caption("Paid · Best reasoning · ~$3/M tokens")
+    anthropic_key = ai_key if ai_provider == "Anthropic Claude (Paid)" else ""
 
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
@@ -181,6 +193,60 @@ spike_prob_orig, factors = spike_probability(
 )
 signal, rationale = trading_signal(spike_prob, current_lmp, roll24_mean)
 vol_label, vol_color = classify_vol_regime(current_vol)
+
+# ─── Auto-refresh ─────────────────────────────────────────────────────────────
+if auto_refresh:
+    import time as _time
+    _time.sleep(300)   # 5 minutes
+    st.cache_data.clear()
+    st.rerun()
+
+# ─── Multi-provider AI call ───────────────────────────────────────────────────
+
+def call_ai(messages: list, system: str, provider: str, key: str) -> str:
+    """
+    Unified AI call supporting Groq, Gemini, and Anthropic.
+    All three use OpenAI-compatible SDK format except Anthropic.
+    """
+    if not key:
+        return "⚠️ No API key provided."
+    try:
+        if provider == "Groq (Free)":
+            from openai import OpenAI
+            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": system}] + messages,
+                max_tokens=1000,
+            )
+            return resp.choices[0].message.content
+
+        elif provider == "Google Gemini (Free)":
+            from openai import OpenAI
+            client = OpenAI(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                api_key=key,
+            )
+            resp = client.chat.completions.create(
+                model="gemini-2.5-flash",
+                messages=[{"role": "system", "content": system}] + messages,
+                max_tokens=1000,
+            )
+            return resp.choices[0].message.content
+
+        else:  # Anthropic
+            import anthropic as _anthropic
+            client = _anthropic.Anthropic(api_key=key)
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1000,
+                system=system,
+                messages=messages,
+            )
+            return resp.content[0].text
+
+    except Exception as e:
+        return f"AI error: {e}"
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 
@@ -677,7 +743,7 @@ with tab6:
     st.markdown("### 🤖 AI Energy Intelligence Agent")
     st.caption("Powered by Claude. Synthesizes live market data + news to answer your energy trading questions.")
 
-    if not anthropic_key:
+    if not ai_key:
         st.warning("⚠️ Enter your Anthropic API key in the sidebar to activate the AI agent.")
         st.markdown("""
         **What the agent can do:**
@@ -767,22 +833,15 @@ When answering:
 
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing..."):
-                    try:
-                        client = anthropic.Anthropic(api_key=anthropic_key)
-                        response = client.messages.create(
-                            model="claude-sonnet-4-20250514",
-                            max_tokens=1000,
-                            system=system_prompt,
-                            messages=[
-                                {"role": m["role"], "content": m["content"]}
-                                for m in st.session_state.messages
-                            ]
-                        )
-                        reply = response.content[0].text
-                        st.markdown(reply)
-                        st.session_state.messages.append({"role": "assistant", "content": reply})
-                    except Exception as e:
-                        st.error(f"Agent error: {e}")
+                    reply = call_ai(
+                        messages=[{"role": m["role"], "content": m["content"]}
+                                  for m in st.session_state.messages],
+                        system=system_prompt,
+                        provider=ai_provider,
+                        key=ai_key,
+                    )
+                    st.markdown(reply)
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
 
         if st.session_state.messages:
             if st.button("Clear conversation"):
