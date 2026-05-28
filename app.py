@@ -74,6 +74,44 @@ st.markdown("""
   h1, h2, h3 { color: #e6edf3 !important; }
   .stTabs [data-baseweb="tab"] { color: #8b949e; }
   .stTabs [aria-selected="true"] { color: #58a6ff !important; border-bottom-color: #58a6ff !important; }
+
+  /* Pulse animation for active decision state */
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(68,187,68,0.4); }
+    50%       { box-shadow: 0 0 0 8px rgba(68,187,68,0); }
+  }
+  @keyframes pulse-red {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,68,68,0.4); }
+    50%       { box-shadow: 0 0 0 8px rgba(255,68,68,0); }
+  }
+  @keyframes pulse-blue {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(88,166,255,0.4); }
+    50%       { box-shadow: 0 0 0 8px rgba(88,166,255,0); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Decision state active gets pulse */
+  div[style*="background:#44bb44"] { animation: pulse-green 2s infinite; }
+  div[style*="background:#ff4444"] { animation: pulse-red   2s infinite; }
+  div[style*="background:#58a6ff"] { animation: pulse-blue  2s infinite; }
+
+  /* Synthesis panel fade-in */
+  .synthesis-panel { animation: fadeIn 0.5s ease; }
+
+  /* Metric cards */
+  div[data-testid="metric-container"] {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 12px;
+    transition: border-color 0.2s;
+  }
+  div[data-testid="metric-container"]:hover {
+    border-color: #58a6ff;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -206,13 +244,17 @@ if auto_refresh:
 def call_ai(messages: list, system: str, provider: str, key: str) -> str:
     """
     Unified AI call supporting Groq, Gemini, and Anthropic.
-    All three use OpenAI-compatible SDK format except Anthropic.
+    Returns response text or a clear error message (never silently fails).
     """
     if not key:
-        return "⚠️ No API key provided."
+        return "⚠️ Enter your API key in the sidebar to activate the AI."
+
     try:
         if provider == "Groq (Free)":
-            from openai import OpenAI
+            try:
+                from openai import OpenAI
+            except ImportError:
+                return "⚠️ Run: pip install openai"
             client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
             resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -222,13 +264,16 @@ def call_ai(messages: list, system: str, provider: str, key: str) -> str:
             return resp.choices[0].message.content
 
         elif provider == "Google Gemini (Free)":
-            from openai import OpenAI
+            try:
+                from openai import OpenAI
+            except ImportError:
+                return "⚠️ Run: pip install openai"
             client = OpenAI(
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
                 api_key=key,
             )
             resp = client.chat.completions.create(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-flash-preview-04-17",
                 messages=[{"role": "system", "content": system}] + messages,
                 max_tokens=1000,
             )
@@ -250,38 +295,134 @@ def call_ai(messages: list, system: str, provider: str, key: str) -> str:
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 
-st.markdown("# ⚡ GridEdge Energy Intelligence")
-st.markdown(f"*Real-time electricity market intelligence for CAISO NP-15 · Updated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
-st.markdown("---")
+# ─── Header ───────────────────────────────────────────────────────────────────
 
-# ─── Top KPI Row ──────────────────────────────────────────────────────────────
-
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-
-with k1:
-    st.metric("⚡ LMP Price", f"${current_lmp:.2f}/MWh",
-              delta=f"{current_lmp - roll24_mean:+.1f} vs 24h avg")
-with k2:
-    st.metric("🌡️ Temperature", f"{current_temp:.0f}°F")
-with k3:
-    st.metric("💨 Wind Speed", f"{current_wind:.0f} mph")
-with k4:
-    st.metric("🔥 Gas Price", f"${current_gas:.2f}/MMBtu")
-with k5:
-    st.metric("📊 Vol Regime", vol_label)
-with k6:
-    st.metric("⚠️ Spike Prob", f"{spike_prob:.0%}")
-
-st.markdown("---")
-
-# ─── Main Signal Banner ───────────────────────────────────────────────────────
-
-color = "#ff4444" if "HEDGE" in signal else "#ffaa00" if "BUY" in signal else "#44bb44"
 st.markdown(f"""
-<div class="signal-box" style="background: {color}22; border: 2px solid {color};">
-  {signal} &nbsp;|&nbsp; <span style="font-size:1rem; font-weight:400;">{rationale}</span>
+<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+  <div>
+    <span style="font-size:1.8rem; font-weight:800; color:#e6edf3;">⚡ GridEdge Intelligence</span>
+    <span style="font-size:0.85rem; color:#8b949e; margin-left:12px;">
+      CAISO NP-15 · {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
+      {"· 🟢 Live" if auto_refresh else "· ⚪ Manual refresh"}
+    </span>
+  </div>
 </div>
 """, unsafe_allow_html=True)
+
+# ─── Three-state decision indicator ──────────────────────────────────────────
+# This is the primary output of the entire system
+
+_sig = signal
+_buy_active   = "BUY"   in _sig
+_hedge_active = "HEDGE" in _sig
+_hold_active  = not _buy_active and not _hedge_active
+
+def _state_style(active, color):
+    if active:
+        return f"background:{color}; color:#000; font-weight:800; border:2px solid {color}; border-radius:8px; padding:10px 18px; font-size:1.05rem; text-align:center;"
+    return f"background:#1c2128; color:#555; font-weight:500; border:1px solid #30363d; border-radius:8px; padding:10px 18px; font-size:1.05rem; text-align:center;"
+
+dec_col1, dec_col2, dec_col3, dec_spacer = st.columns([1, 1, 1, 3])
+with dec_col1:
+    st.markdown(f'<div style="{_state_style(_buy_active, "#44bb44")}">📥 BUY EARLY</div>', unsafe_allow_html=True)
+with dec_col2:
+    st.markdown(f'<div style="{_state_style(_hold_active, "#58a6ff")}">⏸ HOLD</div>', unsafe_allow_html=True)
+with dec_col3:
+    st.markdown(f'<div style="{_state_style(_hedge_active, "#ff4444")}">🛡 HEDGE</div>', unsafe_allow_html=True)
+with dec_spacer:
+    st.markdown(f'<div style="color:#8b949e; font-size:0.85rem; padding:12px 0;">{rationale}</div>', unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ─── KPI Row ─────────────────────────────────────────────────────────────────
+
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+with k1:
+    st.metric("⚡ LMP", f"${current_lmp:.2f}/MWh",
+              delta=f"{current_lmp - roll24_mean:+.1f} vs 24h avg")
+with k2:
+    st.metric("🔮 ML Forecast", f"${ml_forecast_point:.0f}/MWh",
+              delta=f"80%: ${ml_forecast_q10:.0f}–${ml_forecast_q90:.0f}")
+with k3:
+    st.metric("⚠️ Spike Prob", f"{spike_prob:.0%}",
+              delta="ML model" if spike_prob > 0.3 else None,
+              delta_color="inverse")
+with k4:
+    st.metric("🌡️ Temperature", f"{current_temp:.0f}°F")
+with k5:
+    st.metric("🔥 Gas", f"${current_gas:.2f}/MMBtu")
+with k6:
+    st.metric("📊 Volatility", vol_label)
+
+st.markdown("---")
+
+# ─── AI Synthesis Panel (proactive, runs automatically) ───────────────────────
+
+with st.expander("🧠 AI Market Intelligence — Live Synthesis", expanded=True):
+    if not ai_key:
+        st.info("Add an API key in the sidebar (Groq is free) to enable live AI synthesis.")
+    else:
+        # Build full market context
+        _gm = genmix.iloc[-1]
+        _news_text = "
+".join([f"- {n['title']}" for n in news[:4]])
+        _fc_24h = forecast.head(24)
+        _max_fc_temp = _fc_24h["temp_f"].max() if len(_fc_24h) > 0 else current_temp
+
+        _synthesis_system = f"""You are GridEdge, an AI energy market analyst for CAISO NP-15.
+Your job: synthesize ALL signals below into ONE coherent procurement recommendation.
+Be specific, quantitative, and decisive. Max 4 sentences. No hedging language.
+
+LIVE SIGNALS:
+Market:       LMP ${current_lmp:.2f}/MWh | 24h avg ${roll24_mean:.2f} | z-score {current_zscore:.2f} | vol {vol_label}
+ML Forecast:  Next hour ${ml_forecast_point:.0f}/MWh | 80% interval ${ml_forecast_q10:.0f}–${ml_forecast_q90:.0f}
+Spike Risk:   {spike_prob:.1%} probability of spike next hour (ML model)
+Weather now:  {current_temp:.0f}°F | wind {current_wind:.0f}mph
+24h forecast: Max temp {_max_fc_temp:.0f}°F
+Generation:   Solar {_gm['solar_mw']:,.0f}MW | Wind {_gm['wind_mw']:,.0f}MW | Gas {_gm['gas_mw']:,.0f}MW
+Gas price:    ${current_gas:.2f}/MMBtu
+News:
+{_news_text}
+
+Output format (strict):
+DECISION: [BUY EARLY / HOLD / HEDGE]
+CONFIDENCE: [Low/Medium/High]
+REASONING: [2-3 sentences connecting the signals above to the decision]
+WATCH: [One specific thing that would change this decision]"""
+
+        _cache_key = f"synthesis_{datetime.utcnow().strftime('%Y%m%d%H%M') // 5 * 5}"
+
+        if "synthesis_cache" not in st.session_state or st.session_state.get("synthesis_key") != _cache_key:
+            with st.spinner("Synthesizing market signals..."):
+                _synthesis = call_ai(
+                    messages=[{"role": "user", "content": "Synthesize current market conditions and give procurement recommendation."}],
+                    system=_synthesis_system,
+                    provider=ai_provider,
+                    key=ai_key,
+                )
+            st.session_state["synthesis_cache"] = _synthesis
+            st.session_state["synthesis_key"] = _cache_key
+        else:
+            _synthesis = st.session_state["synthesis_cache"]
+
+        # Parse and display synthesis
+        _lines = _synthesis.strip().split("
+")
+        for _line in _lines:
+            if _line.startswith("DECISION:"):
+                _dec = _line.replace("DECISION:", "").strip()
+                _dc = "#44bb44" if "BUY" in _dec else "#ff4444" if "HEDGE" in _dec else "#58a6ff"
+                st.markdown(f'<div style="font-size:1.3rem; font-weight:800; color:{_dc}; margin-bottom:6px;">{_dec}</div>', unsafe_allow_html=True)
+            elif _line.startswith("CONFIDENCE:"):
+                st.markdown(f'<span style="color:#8b949e; font-size:0.9rem;">{_line}</span>', unsafe_allow_html=True)
+            elif _line.startswith("REASONING:"):
+                st.markdown(_line.replace("REASONING:", "**Why:**"))
+            elif _line.startswith("WATCH:"):
+                st.markdown(_line.replace("WATCH:", "👁 **Watch:**"))
+            elif _line.strip():
+                st.markdown(_line)
+
+        st.caption(f"Synthesized from: LMP data · ML forecast · {len(news)} news signals · weather forecast · generation mix")
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
@@ -741,17 +882,24 @@ with tab5:
 
 with tab6:
     st.markdown("### 🤖 AI Energy Intelligence Agent")
-    st.caption("Powered by Claude. Synthesizes live market data + news to answer your energy trading questions.")
+
+    _provider_display = ai_provider.split(" (")[0]
+    st.caption(f"Powered by {_provider_display} · Live market context injected · Ask anything about current conditions")
+
+    # Connection status indicator
+    if ai_key:
+        st.success(f"✅ {_provider_display} connected — agent ready")
+    else:
+        st.warning(f"⚠️ No API key. Get a free Groq key at console.groq.com (takes 2 min, no credit card)")
 
     if not ai_key:
-        st.warning("⚠️ Enter your Anthropic API key in the sidebar to activate the AI agent.")
         st.markdown("""
-        **What the agent can do:**
-        - Analyze current market conditions and explain the spike signal
-        - Interpret breaking news in the context of your position
-        - Recommend hedging strategies based on live data
-        - Answer complex 'what if' questions in plain English
-        - Explain electricity market mechanics (LMP, Day-Ahead vs Real-Time, etc.)
+        **Once connected, the agent can:**
+        - Explain the current BUY/HOLD/HEDGE recommendation in plain English
+        - Interpret how today's news affects electricity prices
+        - Answer what-if questions: "what if temp rises 10°F?"
+        - Explain LMP, DA/RT spread, and market mechanics
+        - Compare current conditions to historical regimes
         """)
     else:
         # Build live market context for the agent
