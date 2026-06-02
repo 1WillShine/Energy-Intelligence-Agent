@@ -24,7 +24,6 @@ from forecasting.model import (
 from models import (
     compute_risk_score, trading_signal, simulate_temp_shock,
     simulate_gas_shock, hedge_expected_value, classify_vol_regime, da_rt_spread_signal,
-    spike_probability, SIGNAL_WEIGHTS,
 )
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
@@ -249,8 +248,7 @@ try:
     ml_forecast_q10   = ml_pred["q10"]
     ml_forecast_q90   = ml_pred["q90"]
 except Exception:
-    spike_prob_tuple = spike_probability(current_temp, current_wind, current_gas, current_hour, current_zscore)
-    spike_prob = spike_prob_tuple[0]
+    spike_prob = 0.05  # fallback default when ML prediction unavailable
     ml_forecast_point = roll24_mean
     ml_forecast_q10   = roll24_mean * 0.8
     ml_forecast_q90   = roll24_mean * 1.3
@@ -287,7 +285,8 @@ signal, rationale = trading_signal(spike_prob, current_lmp, roll24_mean)
 vol_label, vol_color = classify_vol_regime(current_vol)
 
 # Factor breakdown for risk tab (rule-based, kept for explainability chart)
-_, factors = spike_probability(current_temp, current_wind, current_gas, current_hour, current_zscore)
+# Factor breakdown from signal fusion model
+factors = {k: v for k, v in risk["signal_contributions"].items()}
 
 # ─── Auto-refresh ─────────────────────────────────────────────────────────────
 if auto_refresh:
