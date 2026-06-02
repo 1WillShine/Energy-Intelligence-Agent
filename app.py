@@ -42,6 +42,32 @@ st.markdown("""
   /* Dark professional theme */
   .stApp { background-color: #0d1117; color: #e6edf3; }
   section[data-testid="stSidebar"] { background-color: #161b22; }
+
+  /* Sidebar text visibility fixes */
+  section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
+  section[data-testid="stSidebar"] .stSelectbox label,
+  section[data-testid="stSidebar"] .stSlider label,
+  section[data-testid="stSidebar"] .stTextInput label { 
+    color: #e6edf3 !important; font-weight: 500 !important;
+  }
+  section[data-testid="stSidebar"] .stCaption,
+  section[data-testid="stSidebar"] p { 
+    color: #8b949e !important; 
+  }
+  section[data-testid="stSidebar"] h2,
+  section[data-testid="stSidebar"] h3 { 
+    color: #58a6ff !important; 
+  }
+  section[data-testid="stSidebar"] .stButton button {
+    background: #21262d !important;
+    color: #e6edf3 !important;
+    border: 1px solid #30363d !important;
+    width: 100%;
+  }
+  section[data-testid="stSidebar"] .stButton button:hover {
+    background: #30363d !important;
+    border-color: #58a6ff !important;
+  }
   .metric-card {
     background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
     border: 1px solid #30363d;
@@ -193,15 +219,50 @@ with st.spinner("Loading energy market data..."):
     data = load_data(price_days)
 
 # Train ML models
-@st.cache_resource(show_spinner="Training ML models on 2 years of data...")
+@st.cache_resource(show_spinner=False)
 def load_models():
-    training_df = generate_training_data(years=2, seed=42)
-    models      = train(training_df)
-    # Compute tight normal-regime intervals on same training data
-    models["normal_intervals"] = compute_normal_regime_intervals(training_df)
-    return models
+    return None  # placeholder — real training done below with progress UI
 
-ml = load_models()
+# ── Visible training progress ─────────────────────────────────────────────────
+# Check if models are already cached (subsequent loads are instant)
+_models_cached = "gridedge_models" in st.session_state
+
+if not _models_cached:
+    st.markdown("## ⚡ GridEdge Intelligence")
+    st.markdown("*Initializing — this takes ~60 seconds on first load, then cached permanently*")
+    st.markdown("---")
+
+    _progress_bar  = st.progress(0)
+    _status        = st.empty()
+    _detail        = st.empty()
+
+    _status.markdown("**Step 1 / 4** — Generating 2 years of training data...")
+    _detail.caption("17,520 hourly rows · CAISO NP-15 · Calibrated to real price behavior")
+    _progress_bar.progress(10)
+    training_df = generate_training_data(years=2, seed=42)
+
+    _status.markdown("**Step 2 / 4** — Engineering 36 features...")
+    _detail.caption("Lag features, rolling stats, weather interactions, gas spread")
+    _progress_bar.progress(30)
+
+    _status.markdown("**Step 3 / 4** — Training XGBoost models (5-fold TimeSeriesSplit CV)...")
+    _detail.caption("Point forecast · Q10/Q90 quantile · Spike classifier · ~45 seconds")
+    _progress_bar.progress(40)
+    ml_result = train(training_df)
+
+    _status.markdown("**Step 4 / 4** — Computing confidence intervals...")
+    _detail.caption("Normal-regime residual std · Separating spike from base scenario")
+    _progress_bar.progress(90)
+    ml_result["normal_intervals"] = compute_normal_regime_intervals(training_df)
+
+    _progress_bar.progress(100)
+    _status.markdown("✅ **Models ready** — loading dashboard...")
+    _detail.empty()
+
+    st.session_state["gridedge_models"] = ml_result
+    st.rerun()
+
+ml = st.session_state["gridedge_models"]
 
 # Use tight normal-regime intervals instead of wide quantile intervals
 _ni = ml["normal_intervals"]
