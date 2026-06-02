@@ -17,10 +17,14 @@ import anthropic
 
 from pipeline import fetch_all, _synthetic_prices, _synthetic_gas, _placeholder_news, fetch_weather_forecast
 from ingestion.realtime import DataManager
-from forecasting.model import generate_training_data, train, predict, build_features, FEATURES
+from forecasting.model import (
+    generate_training_data, train, predict, build_features, FEATURES,
+    compute_normal_regime_intervals, price_scenario_analysis,
+)
 from models import (
-    spike_probability, trading_signal, simulate_temp_shock,
-    simulate_gas_shock, hedge_expected_value, classify_vol_regime, da_rt_spread_signal
+    compute_risk_score, trading_signal, simulate_temp_shock,
+    simulate_gas_shock, hedge_expected_value, classify_vol_regime, da_rt_spread_signal,
+    spike_probability, SIGNAL_WEIGHTS,
 )
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
@@ -117,6 +121,19 @@ st.markdown("""
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
+# ─── Load secrets (Streamlit Cloud) or fall back to empty ────────────────────
+def _get_secret(key: str, default: str = "") -> str:
+    """Read from st.secrets (Streamlit Cloud) or return default."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+_default_provider = _get_secret("DEFAULT_AI_PROVIDER", "Groq (Free)")
+_default_groq_key = _get_secret("GROQ_API_KEY", "")
+_default_gemini_key = _get_secret("GEMINI_API_KEY", "")
+_default_anthropic_key = _get_secret("ANTHROPIC_API_KEY", "")
+
 with st.sidebar:
     st.markdown("## ⚡ GridEdge Intelligence")
     st.markdown("*Energy Market Intelligence Platform*")
@@ -126,19 +143,29 @@ with st.sidebar:
     ai_provider = st.selectbox(
         "Provider",
         ["Groq (Free)", "Google Gemini (Free)", "Anthropic Claude (Paid)"],
+        index=["Groq (Free)", "Google Gemini (Free)", "Anthropic Claude (Paid)"].index(_default_provider),
     )
     if ai_provider == "Groq (Free)":
-        ai_key = st.text_input("Groq API Key", type="password",
+        ai_key = st.text_input("Groq API Key", value=_default_groq_key, type="password",
                                help="Free at console.groq.com")
-        st.caption("Free · 14,400 req/day · Llama 3.3 70B")
+        if _default_groq_key:
+            st.caption("✅ Pre-configured · Groq Llama 3.3 70B")
+        else:
+            st.caption("Free · console.groq.com · no credit card")
     elif ai_provider == "Google Gemini (Free)":
-        ai_key = st.text_input("Gemini API Key", type="password",
+        ai_key = st.text_input("Gemini API Key", value=_default_gemini_key, type="password",
                                help="Free at aistudio.google.com")
-        st.caption("Free · 1,500 req/day · Gemini 2.5 Flash")
+        if _default_gemini_key:
+            st.caption("✅ Pre-configured · Gemini 2.5 Flash")
+        else:
+            st.caption("Free · aistudio.google.com · no credit card")
     else:
-        ai_key = st.text_input("Anthropic API Key", type="password",
+        ai_key = st.text_input("Anthropic API Key", value=_default_anthropic_key, type="password",
                                help="Paid at console.anthropic.com")
-        st.caption("Paid · Best reasoning · ~$3/M tokens")
+        if _default_anthropic_key:
+            st.caption("✅ Pre-configured · Claude Sonnet")
+        else:
+            st.caption("Paid · ~$3/M tokens")
     anthropic_key = ai_key if ai_provider == "Anthropic Claude (Paid)" else ""
 
     st.markdown("---")
@@ -167,12 +194,21 @@ with st.spinner("Loading energy market data..."):
     data = load_data(price_days)
 
 # Train ML models
-@st.cache_resource(show_spinner="Training ML models...")
+@st.cache_resource(show_spinner="Training ML models on 2 years of data...")
 def load_models():
     training_df = generate_training_data(years=2, seed=42)
-    return train(training_df)
+    models      = train(training_df)
+    # Compute tight normal-regime intervals on same training data
+    models["normal_intervals"] = compute_normal_regime_intervals(training_df)
+    return models
 
 ml = load_models()
+
+# Use tight normal-regime intervals instead of wide quantile intervals
+_ni = ml["normal_intervals"]
+ml_forecast_normal_low  = _ni["ci_low"]
+ml_forecast_normal_high = _ni["ci_high"]
+ml_forecast_resid_std   = _ni["resid_std"]
 
 merged = data["merged"]
 genmix = data["genmix"]
@@ -219,18 +255,39 @@ except Exception:
     ml_forecast_q10   = roll24_mean * 0.8
     ml_forecast_q90   = roll24_mean * 1.3
 
-# Compute signal (uses spike_prob from ML)
-_dummy, factors = spike_probability(
-    current_temp, current_wind, current_gas, current_hour, current_zscore
-)
-spike_prob_rule = _dummy  # kept for factor breakdown visual only
+# ── Signal fusion (all quantitative, no AI involvement) ──
+_gm_latest    = genmix.iloc[-1]
+_gas_roll7d   = float(gas["gas_price"].rolling(7).mean().iloc[-1]) if len(gas) >= 7 else current_gas
+_gas_roll7d   = _gas_roll7d if not np.isnan(_gas_roll7d) else current_gas
 
-# Compute spike probability + signal (uses ML spike_prob)
-spike_prob_orig, factors = spike_probability(
-    current_temp, current_wind, current_gas, current_hour, current_zscore
+risk = compute_risk_score(
+    ml_spike_prob    = spike_prob,
+    temp_f           = current_temp,
+    wind_mph         = current_wind,
+    gas_price        = current_gas,
+    gas_roll7d       = _gas_roll7d,
+    hour             = current_hour,
+    lmp_zscore       = current_zscore,
+    forecast_df      = forecast,
+    solar_mw         = float(_gm_latest["solar_mw"]),
+    wind_mw          = float(_gm_latest["wind_mw"]),
+    total_mw         = float(_gm_latest["total_mw"]),
+    volatility       = current_vol,
 )
+
+decision      = risk["decision"]          # BUY EARLY / HOLD / HEDGE
+risk_score    = risk["risk_score"]        # 0-1 float
+confidence    = risk["confidence"]        # Low/Medium/High
+top_driver    = risk["top_driver"]        # name of highest-weight signal
+signal_vals   = risk["signal_values"]     # dict of normalized signals
+signal_contribs = risk["signal_contributions"]
+
+# Legacy signal for backward compat
 signal, rationale = trading_signal(spike_prob, current_lmp, roll24_mean)
 vol_label, vol_color = classify_vol_regime(current_vol)
+
+# Factor breakdown for risk tab (rule-based, kept for explainability chart)
+_, factors = spike_probability(current_temp, current_wind, current_gas, current_hour, current_zscore)
 
 # ─── Auto-refresh ─────────────────────────────────────────────────────────────
 if auto_refresh:
@@ -312,10 +369,9 @@ st.markdown(f"""
 # ─── Three-state decision indicator ──────────────────────────────────────────
 # This is the primary output of the entire system
 
-_sig = signal
-_buy_active   = "BUY"   in _sig
-_hedge_active = "HEDGE" in _sig
-_hold_active  = not _buy_active and not _hedge_active
+_buy_active   = decision == "BUY EARLY"
+_hedge_active = decision == "HEDGE"
+_hold_active  = decision == "HOLD"
 
 def _state_style(active, color):
     if active:
@@ -330,7 +386,8 @@ with dec_col2:
 with dec_col3:
     st.markdown(f'<div style="{_state_style(_hedge_active, "#ff4444")}">🛡 HEDGE</div>', unsafe_allow_html=True)
 with dec_spacer:
-    st.markdown(f'<div style="color:#8b949e; font-size:0.85rem; padding:12px 0;">{rationale}</div>', unsafe_allow_html=True)
+    _rationale_txt = f"Risk score: {risk_score:.2f}/1.0 · Confidence: {confidence} · Top driver: {top_driver.replace('_',' ')}"
+    st.markdown(f'<div style="color:#8b949e; font-size:0.85rem; padding:12px 0;">{_rationale_txt}</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -369,25 +426,41 @@ with st.expander("🧠 AI Market Intelligence — Live Synthesis", expanded=True
         _max_fc_temp = _fc_24h["temp_f"].max() if len(_fc_24h) > 0 else current_temp
 
         _synthesis_system = f"""You are GridEdge, an AI energy market analyst for CAISO NP-15.
-Your job: synthesize ALL signals below into ONE coherent procurement recommendation.
-Be specific, quantitative, and decisive. Max 4 sentences. No hedging language.
 
-LIVE SIGNALS:
-Market:       LMP ${current_lmp:.2f}/MWh | 24h avg ${roll24_mean:.2f} | z-score {current_zscore:.2f} | vol {vol_label}
-ML Forecast:  Next hour ${ml_forecast_point:.0f}/MWh | 80% interval ${ml_forecast_q10:.0f}–${ml_forecast_q90:.0f}
-Spike Risk:   {spike_prob:.1%} probability of spike next hour (ML model)
-Weather now:  {current_temp:.0f}°F | wind {current_wind:.0f}mph
-24h forecast: Max temp {_max_fc_temp:.0f}°F
-Generation:   Solar {_gm['solar_mw']:,.0f}MW | Wind {_gm['wind_mw']:,.0f}MW | Gas {_gm['gas_mw']:,.0f}MW
-Gas price:    ${current_gas:.2f}/MMBtu
-News:
+CRITICAL RULES:
+- You ONLY interpret the numbers provided below. You do NOT generate new numbers.
+- Do NOT invent prices, probabilities, or statistics not listed here.
+- Do NOT make claims about news events beyond the headlines provided.
+- Every statement must trace directly to a number in the LIVE SIGNALS section.
+
+LIVE SIGNALS (computed by quantitative models, not by you):
+Decision engine: {decision} | Risk score: {risk_score:.2f}/1.0 | Confidence: {confidence}
+Top risk driver: {top_driver.replace('_',' ')}
+
+Signal breakdown (normalized 0-1):
+  ML spike probability:  {signal_vals['ml_spike_prob']:.2f}  (XGBoost model output)
+  Heat stress:           {signal_vals['heat_stress']:.2f}  (temp {current_temp:.0f}°F)
+  Price momentum:        {signal_vals['price_momentum']:.2f}  (z-score {current_zscore:.2f})
+  Peak hour:             {signal_vals['peak_hour']:.2f}  (hour {current_hour}:00)
+  Gas pressure:          {signal_vals['gas_pressure']:.2f}  (${current_gas:.2f}/MMBtu)
+  Forecast stress:       {signal_vals['forecast_stress']:.2f}  (max {_max_fc_temp:.0f}°F next 24h)
+  Wind deficit:          {signal_vals['wind_deficit']:.2f}  ({current_wind:.0f}mph)
+  Renewable deficit:     {signal_vals['renewable_deficit']:.2f}
+
+Market context:
+  LMP now:      ${current_lmp:.2f}/MWh (24h avg ${roll24_mean:.2f}, z={current_zscore:.2f})
+  ML forecast:  ${ml_forecast_point:.0f}/MWh next hour (80% CI: ${ml_forecast_q10:.0f}-${ml_forecast_q90:.0f})
+  Volatility:   {vol_label}
+  Generation:   Solar {_gm['solar_mw']:,.0f}MW | Wind {_gm['wind_mw']:,.0f}MW | Gas {_gm['gas_mw']:,.0f}MW
+
+Recent headlines (do not embellish):
 {_news_text}
 
-Output format (strict):
-DECISION: [BUY EARLY / HOLD / HEDGE]
-CONFIDENCE: [Low/Medium/High]
-REASONING: [2-3 sentences connecting the signals above to the decision]
-WATCH: [One specific thing that would change this decision]"""
+Output format (STRICT — use exactly these labels):
+DECISION: {decision}
+CONFIDENCE: {confidence}
+REASONING: [2-3 sentences. Cite specific numbers from above. No invented statistics.]
+WATCH: [One specific threshold or event that would change the decision. Must be quantitative.]"""
 
         _cache_key = f"synthesis_{datetime.utcnow().strftime('%Y%m%d%H')}{(datetime.utcnow().minute // 5) * 5}"
 
@@ -782,100 +855,143 @@ with tab4:
 
 with tab5:
     st.markdown("### 🔮 ML Price Forecast")
-    st.caption("XGBoost trained on 2 years of synthetic CAISO data · TimeSeriesSplit cross-validation · No data leakage")
+    st.caption("XGBoost · 2-year training · TimeSeriesSplit CV · Normal-regime intervals (separate from spike risk)")
 
-    # Model performance metrics
     cv = ml["cv_metrics"]
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("Mean MAE", f"${cv['mae'].mean():.2f}/MWh")
     with m2:
-        st.metric("Training rows", f"{ml['n_rows']:,}")
+        st.metric("Normal CI width", f"${ml_forecast_normal_high - ml_forecast_normal_low:.0f}/MWh",
+                  delta="tighter than quantile regression")
     with m3:
-        st.metric("CV Folds", "5 (TimeSeriesSplit)")
+        st.metric("Residual Std", f"${ml_forecast_resid_std:.2f}/MWh")
     with m4:
         st.metric("Spike rate (train)", f"{ml['spike_rate']:.2%}")
 
     st.markdown("---")
 
-    # Next hour forecast
     fa, fb = st.columns(2)
     with fa:
         st.markdown("#### Next Hour Price Forecast")
+        st.caption("Normal-regime interval (excludes spike scenario — shown separately below)")
+
+        # Gauge-style visualization
         fig_fc = go.Figure()
-        fig_fc.add_trace(go.Bar(
-            x=["Q10 (low)", "Point Forecast", "Q90 (high)"],
-            y=[ml_forecast_q10, ml_forecast_point, ml_forecast_q90],
-            marker_color=["#44bb44", "#58a6ff", "#ff4444"],
-            text=[f"${v:.0f}" for v in [ml_forecast_q10, ml_forecast_point, ml_forecast_q90]],
-            textposition="outside",
+        # Confidence band
+        fig_fc.add_trace(go.Scatter(
+            x=["Low (10%)", "Point", "High (90%)"],
+            y=[ml_forecast_normal_low, ml_forecast_point, ml_forecast_normal_high],
+            mode="markers+lines",
+            marker=dict(size=[12, 18, 12],
+                        color=["#44bb44", "#58a6ff", "#f0a500"],
+                        symbol=["circle", "diamond", "circle"]),
+            line=dict(color="#30363d", width=2),
+            name="Normal regime CI",
         ))
-        fig_fc.add_hline(y=current_lmp, line_dash="dash", line_color="#f0a500",
-                         annotation_text=f"Current: ${current_lmp:.0f}")
+        fig_fc.add_hline(y=current_lmp, line_dash="dash", line_color="#ff4444",
+                         annotation_text=f"Current ${current_lmp:.0f}")
+        fig_fc.add_hline(y=ml_forecast_point, line_dash="dot", line_color="#58a6ff",
+                         annotation_text=f"Forecast ${ml_forecast_point:.0f}")
         fig_fc.update_layout(
             template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-            height=300, yaxis_title="LMP ($/MWh)",
-            title=f"80% confidence interval: ${ml_forecast_q10:.0f}–${ml_forecast_q90:.0f}/MWh"
+            height=280, yaxis_title="LMP ($/MWh)",
+            title=f"80% CI: ${ml_forecast_normal_low:.0f}–${ml_forecast_normal_high:.0f}/MWh (normal conditions)",
         )
         st.plotly_chart(fig_fc, use_container_width=True)
+
         st.markdown(f"""
         | | Value |
         |---|---|
         | Point forecast | **${ml_forecast_point:.2f}/MWh** |
-        | 80% interval | **${ml_forecast_q10:.0f} – ${ml_forecast_q90:.0f}/MWh** |
-        | ML spike prob | **{spike_prob:.1%}** |
+        | Normal 80% CI | **${ml_forecast_normal_low:.0f}–${ml_forecast_normal_high:.0f}/MWh** |
+        | Spike probability | **{spike_prob:.1%}** (separate risk) |
         | Current LMP | **${current_lmp:.2f}/MWh** |
+        | Model accuracy | **±${ml_forecast_resid_std:.2f}/MWh** avg error |
         """)
 
     with fb:
         st.markdown("#### Feature Importance")
-        imp = ml["feature_importance"].head(15)
+        imp = ml["feature_importance"].head(12)
         fig_imp = go.Figure(go.Bar(
             x=imp["importance"],
-            y=imp["feature"],
+            y=imp["feature"].str.replace("_", " "),
             orientation="h",
-            marker_color="#58a6ff",
+            marker_color=[
+                "#ff4444" if v > 0.06 else "#f0a500" if v > 0.03 else "#58a6ff"
+                for v in imp["importance"]
+            ],
         ))
         fig_imp.update_layout(
             template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-            height=400, xaxis_title="Importance",
+            height=380, xaxis_title="Importance score",
             yaxis=dict(autorange="reversed"),
         )
         st.plotly_chart(fig_imp, use_container_width=True)
-        st.caption("Top driver: rolling price volatility (lmp_roll24_std) + peak hour indicators")
 
-    # CV fold performance chart
-    st.markdown("#### Cross-Validation Performance by Fold")
-    st.caption("Each fold trains on earlier data, validates on later data — ensures no future leakage")
+    # ── Scenario Analysis ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📊 Price Scenario Analysis")
+    st.caption("What each scenario means for a commercial electricity buyer")
+
+    scenarios = price_scenario_analysis(
+        point       = ml_forecast_point,
+        ci_low      = ml_forecast_normal_low,
+        ci_high     = ml_forecast_normal_high,
+        spike_prob  = spike_prob,
+        roll24_mean = roll24_mean,
+        current_lmp = current_lmp,
+    )
+
+    sc_cols = st.columns(len(scenarios))
+    for col, sc in zip(sc_cols, scenarios):
+        with col:
+            st.markdown(f"""
+<div style="background:#161b22; border-left:3px solid {sc['color']};
+     border-radius:0 8px 8px 0; padding:14px; height:100%;">
+  <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase;
+       letter-spacing:1px; margin-bottom:6px;">{sc['scenario']}</div>
+  <div style="font-size:1.3rem; font-weight:700; color:{sc['color']};
+       margin-bottom:6px;">{sc['price']}</div>
+  <div style="font-size:0.78rem; color:#8b949e; margin-bottom:4px;">
+    Probability: {sc['probability']}</div>
+  <div style="font-size:0.82rem; color:#e6edf3; margin-bottom:8px;">
+    {sc['implication']}</div>
+  <div style="font-size:0.78rem; color:{sc['color']}; font-weight:600;">
+    → {sc['action']}</div>
+</div>""", unsafe_allow_html=True)
+
+    # CV performance chart
+    st.markdown("---")
+    st.markdown("#### Model Validation (TimeSeriesSplit)")
+    st.caption("Fold N always trains on past data, validates on future — prevents leakage")
     fig_cv = go.Figure()
     fig_cv.add_trace(go.Bar(
         x=[f"Fold {i}" for i in cv["fold"]],
         y=cv["mae"],
-        name="MAE ($/MWh)",
-        marker_color="#58a6ff",
+        marker_color=["#ff4444" if v > cv["mae"].mean()*1.2 else "#58a6ff" for v in cv["mae"]],
         text=[f"${v:.1f}" for v in cv["mae"]],
         textposition="outside",
     ))
     fig_cv.add_hline(y=cv["mae"].mean(), line_dash="dash", line_color="#f0a500",
-                     annotation_text=f"Mean: ${cv['mae'].mean():.2f}")
+                     annotation_text=f"Mean MAE: ${cv['mae'].mean():.2f}")
     fig_cv.update_layout(
         template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        height=280, yaxis_title="MAE ($/MWh)",
+        height=260, yaxis_title="MAE ($/MWh)",
     )
     st.plotly_chart(fig_cv, use_container_width=True)
 
-    # Model explainability note
-    st.markdown("#### Why These Features?")
+    st.markdown("#### Why These Features Matter")
     st.markdown("""
-    | Feature | Why it matters |
+    | Feature | Economic reason |
     |---|---|
-    |  | High recent volatility predicts more volatility |
-    |  | Morning/evening demand peaks drive prices |
-    |  | Same hour yesterday is strongest price predictor |
-    |  | AC load above 85°F drives demand spikes |
-    |  | Gas peakers set the marginal cost → LMP |
-    |  | Afternoon solar suppresses midday prices |
-    |  | Price momentum: elevated prices tend to persist |
+    | `lmp_roll24_std` | High recent volatility → more volatility expected |
+    | `is_peak` | 7-10am / 5-9pm demand peaks structurally drive prices |
+    | `lmp_lag24` | Same hour yesterday: strongest single predictor |
+    | `heat_stress` | AC load above 85°F creates nonlinear demand surge |
+    | `gas_price` | Gas peakers set marginal cost → LMP in high-demand hours |
+    | `solar_roll6` | 6-hour solar average suppresses midday prices |
+    | `lmp_zscore` | Price above rolling mean tends to revert or escalate |
     """)
 
 with tab6:
