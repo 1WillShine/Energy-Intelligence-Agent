@@ -130,6 +130,31 @@ st.markdown("""
   /* Synthesis panel fade-in */
   .synthesis-panel { animation: fadeIn 0.5s ease; }
 
+  /* Expander — dark background, readable header */
+  div[data-testid="stExpander"] {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+  }
+  div[data-testid="stExpander"] summary {
+    background: #1c2128 !important;
+    border-radius: 8px !important;
+    padding: 12px 16px !important;
+  }
+  div[data-testid="stExpander"] summary span,
+  div[data-testid="stExpander"] summary p {
+    color: #58a6ff !important;
+    font-weight: 600 !important;
+    font-size: 1rem !important;
+  }
+  div[data-testid="stExpander"] summary svg {
+    fill: #58a6ff !important;
+  }
+  div[data-testid="stExpander"] > div {
+    background: #161b22 !important;
+    padding: 16px !important;
+  }
+
   /* Metric cards */
   div[data-testid="metric-container"] {
     background: #161b22;
@@ -538,20 +563,25 @@ WATCH: [One specific threshold or event that would change the decision. Must be 
             _synthesis = st.session_state["synthesis_cache"]
 
         # Parse and display synthesis
-        _lines = _synthesis.strip().splitlines()
-        for _line in _lines:
-            if _line.startswith("DECISION:"):
-                _dec = _line.replace("DECISION:", "").strip()
-                _dc = "#44bb44" if "BUY" in _dec else "#ff4444" if "HEDGE" in _dec else "#58a6ff"
-                st.markdown(f'<div style="font-size:1.3rem; font-weight:800; color:{_dc}; margin-bottom:6px;">{_dec}</div>', unsafe_allow_html=True)
-            elif _line.startswith("CONFIDENCE:"):
-                st.markdown(f'<span style="color:#8b949e; font-size:0.9rem;">{_line}</span>', unsafe_allow_html=True)
-            elif _line.startswith("REASONING:"):
-                st.markdown(_line.replace("REASONING:", "**Why:**"))
-            elif _line.startswith("WATCH:"):
-                st.markdown(_line.replace("WATCH:", "👁 **Watch:**"))
-            elif _line.strip():
-                st.markdown(_line)
+        if _synthesis.startswith("⚠️") or "error" in _synthesis.lower()[:20]:
+            st.error(_synthesis)
+            if "401" in _synthesis or "invalid_api_key" in _synthesis:
+                st.info("👉 Your Groq API key is invalid or expired. Go to console.groq.com → API Keys → create a new key → update in Streamlit Cloud Settings → Secrets.")
+        else:
+            _lines = _synthesis.strip().splitlines()
+            for _line in _lines:
+                if _line.startswith("DECISION:"):
+                    _dec = _line.replace("DECISION:", "").strip()
+                    _dc = "#44bb44" if "BUY" in _dec else "#ff4444" if "HEDGE" in _dec else "#58a6ff"
+                    st.markdown(f'<div style="font-size:1.3rem; font-weight:800; color:{_dc}; margin-bottom:6px;">{_dec}</div>', unsafe_allow_html=True)
+                elif _line.startswith("CONFIDENCE:"):
+                    st.markdown(f'<span style="color:#8b949e; font-size:0.9rem;">{_line}</span>', unsafe_allow_html=True)
+                elif _line.startswith("REASONING:"):
+                    st.markdown(_line.replace("REASONING:", "**Why:**"))
+                elif _line.startswith("WATCH:"):
+                    st.markdown(_line.replace("WATCH:", "👁 **Watch:**"))
+                elif _line.strip():
+                    st.markdown(_line)
 
         st.caption(f"Synthesized from: LMP data · ML forecast · {len(news)} news signals · weather forecast · generation mix")
 
@@ -853,38 +883,56 @@ with tab4:
     with sim_col1:
         st.markdown("**Temperature shock**")
         delta_temp = st.slider("Temperature change (°F)", -20, +30, +5)
-        sim_t = simulate_temp_shock(current_temp, delta_temp, current_wind,
-                                    current_gas, current_hour, current_zscore)
+        sim_t = simulate_temp_shock(
+            base_temp_f=current_temp, delta_f=delta_temp, wind_mph=current_wind,
+            gas_price=current_gas, gas_roll7d=_gas_roll7d, hour=current_hour,
+            lmp_zscore=current_zscore, forecast_df=forecast,
+            solar_mw=float(_gm_latest["solar_mw"]), wind_mw=float(_gm_latest["wind_mw"]),
+            total_mw=float(_gm_latest["total_mw"]), volatility=current_vol,
+            ml_spike_prob=spike_prob,
+        )
+        _base_pct  = sim_t["base_score"]  * 100
+        _shock_pct = sim_t["shock_score"] * 100
         fig_sim_t = go.Figure(go.Bar(
             x=["Base", f"Base + {delta_temp}°F"],
-            y=[sim_t["base_prob"] * 100, sim_t["shock_prob"] * 100],
-            marker_color=["#58a6ff", "#ff4444" if sim_t["shock_prob"] > 0.4 else "#f0a500"],
-            text=[f"{sim_t['base_prob']:.1%}", f"{sim_t['shock_prob']:.1%}"],
-            textposition="outside"
+            y=[_base_pct, _shock_pct],
+            marker_color=["#58a6ff", "#ff4444" if _shock_pct > 40 else "#f0a500"],
+            text=[f"{_base_pct:.1f}%", f"{_shock_pct:.1f}%"],
+            textposition="outside",
         ))
         fig_sim_t.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
                                 plot_bgcolor="#0d1117", height=220,
-                                yaxis=dict(range=[0, 110], title="Spike Probability (%)"))
+                                yaxis=dict(range=[0, 110], title="Risk Score (%)"))
         st.plotly_chart(fig_sim_t, use_container_width=True)
-        st.caption(f"Δ Probability: **{sim_t['delta_prob']:+.1%}**")
+        _dec_change = "" if sim_t["base_decision"] == sim_t["shock_decision"] else f" → **{sim_t['shock_decision']}**"
+        st.caption(f"Δ Risk score: **{sim_t['delta_score']:+.2f}**{_dec_change}")
 
     with sim_col2:
         st.markdown("**Gas price shock**")
         delta_gas = st.slider("Gas price change ($/MMBtu)", -2.0, +4.0, +1.0, step=0.25)
-        sim_g = simulate_gas_shock(current_temp, current_wind, current_gas,
-                                   delta_gas, current_hour, current_zscore)
+        sim_g = simulate_gas_shock(
+            temp_f=current_temp, wind_mph=current_wind,
+            base_gas=current_gas, delta_gas=delta_gas, gas_roll7d=_gas_roll7d,
+            hour=current_hour, lmp_zscore=current_zscore, forecast_df=forecast,
+            solar_mw=float(_gm_latest["solar_mw"]), wind_mw=float(_gm_latest["wind_mw"]),
+            total_mw=float(_gm_latest["total_mw"]), volatility=current_vol,
+            ml_spike_prob=spike_prob,
+        )
+        _base_pct_g  = sim_g["base_score"]  * 100
+        _shock_pct_g = sim_g["shock_score"] * 100
         fig_sim_g = go.Figure(go.Bar(
             x=["Base", f"Base + ${delta_gas:.2f}"],
-            y=[sim_g["base_prob"] * 100, sim_g["shock_prob"] * 100],
-            marker_color=["#58a6ff", "#ff4444" if sim_g["shock_prob"] > 0.4 else "#f0a500"],
-            text=[f"{sim_g['base_prob']:.1%}", f"{sim_g['shock_prob']:.1%}"],
-            textposition="outside"
+            y=[_base_pct_g, _shock_pct_g],
+            marker_color=["#58a6ff", "#ff4444" if _shock_pct_g > 40 else "#f0a500"],
+            text=[f"{_base_pct_g:.1f}%", f"{_shock_pct_g:.1f}%"],
+            textposition="outside",
         ))
         fig_sim_g.update_layout(template="plotly_dark", paper_bgcolor="#0d1117",
                                 plot_bgcolor="#0d1117", height=220,
-                                yaxis=dict(range=[0, 110], title="Spike Probability (%)"))
+                                yaxis=dict(range=[0, 110], title="Risk Score (%)"))
         st.plotly_chart(fig_sim_g, use_container_width=True)
-        st.caption(f"Δ Probability: **{sim_g['delta_prob']:+.1%}**")
+        _dec_change_g = "" if sim_g["base_decision"] == sim_g["shock_decision"] else f" → **{sim_g['shock_decision']}**"
+        st.caption(f"Δ Risk score: **{sim_g['delta_score']:+.2f}**{_dec_change_g}")
 
     # Rolling spike probability over time
     st.markdown("#### Rolling Spike Probability (Last 14 Days)")
